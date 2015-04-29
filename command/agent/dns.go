@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -278,6 +279,12 @@ func (d *DNSServer) dispatch(network string, req, resp *dns.Msg) {
 	labels := dns.SplitDomainName(qName)
 
 	// The last label is either "node", "service" or a datacenter name
+	// If given only one label, consider this a kvs-dns query, not normal consul
+	// discovery.
+	if len(labels) == 1 {
+		d.kvsLookup(network, datacenter, labels[0], req, resp)
+		return
+	}
 PARSE:
 	n := len(labels)
 	if n == 0 {
@@ -442,6 +449,84 @@ func (d *DNSServer) formatNodeRecord(node *structs.Node, addr, qName string, qTy
 		}
 	}
 	return records
+}
+
+func (d *DNSServer) kvsLookup(network, datacenter, key string, req, resp *dns.Msg) {
+	// DNS entries should be stored in dns/ folder
+	key = "dns/" + key + "/"
+	// Make an KVS request
+	args := structs.KeyRequest{
+		Key:          key,
+		Datacenter:   datacenter,
+		QueryOptions: structs.QueryOptions{AllowStale: d.config.AllowStale},
+	}
+	var out structs.IndexedDirEntries
+RPC:
+	if err := d.agent.RPC("KVS.List", &args, &out); err != nil {
+		d.logger.Printf("[ERR] dns: rpc error: %v", err)
+		resp.SetRcode(req, dns.RcodeServerFailure)
+		return
+	}
+
+	// Verify that request is not too stale, redo the request
+	if args.AllowStale && out.LastContact > d.config.MaxStale {
+		args.AllowStale = false
+		d.logger.Printf("[WARN] dns: Query results too stale, re-requesting")
+		goto RPC
+	}
+
+	// If we have no values, return not found!
+	if len(out.Entries) == 0 {
+		resp.SetRcode(req, dns.RcodeNameError)
+		return
+	}
+
+	// Determine the TTL
+	// TODO: Determine TTL by parsing the entry
+	var ttl time.Duration
+	if d.config.ServiceTTL != nil {
+		ttl = d.config.ServiceTTL["*"]
+	}
+
+	// Perform a random shuffle
+	shuffleKvsEntries(out.Entries)
+
+	// If the network is not TCP, restrict the number of responses
+	if network != "tcp" && len(out.Entries) > maxServiceResponses {
+		out.Entries = out.Entries[:maxServiceResponses]
+		// Flag that there are more records to return in the UDP response
+		if d.config.EnableTruncate == true {
+			resp.Truncated = true
+		}
+	}
+
+	qName := req.Question[0].Name
+	qType := req.Question[0].Qtype
+	handled := make(map[string]struct{})
+	for _, entry := range out.Entries {
+		node := &structs.Node{}
+		if err := json.Unmarshal(entry.Value, &node); err != nil {
+			continue
+		}
+		addr := node.Address
+		if _, ok := handled[addr]; ok {
+			continue
+		}
+		handled[addr] = struct{}{}
+
+		records := d.formatNodeRecord(node, addr, qName, qType, ttl)
+		if records != nil {
+			resp.Answer = append(resp.Answer, records...)
+		}
+	}
+}
+
+// shuffleKvsEntries does an in-place random shuffle using the Fisher-Yates algorithm
+func shuffleKvsEntries(nodes structs.DirEntries) {
+	for i := len(nodes) - 1; i > 0; i-- {
+		j := rand.Int31() % int32(i+1)
+		nodes[i], nodes[j] = nodes[j], nodes[i]
+	}
 }
 
 // serviceLookup is used to handle a service query
